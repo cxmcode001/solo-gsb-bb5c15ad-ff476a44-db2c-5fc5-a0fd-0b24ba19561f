@@ -116,6 +116,74 @@ export interface ResilienceInvalid {
 
 export type ResilienceResult = ResilienceOk | ResilienceInvalid;
 
+// ============ 供水能力核验 ============
+
+export interface CapacityQuery {
+  /** 供水点节点 */
+  supplies: string[];
+  /** 保供出口节点 */
+  outlets: string[];
+  /** 供水点节点名 -> 供给上限（非负整数） */
+  supplyCaps: Record<string, number>;
+  /** 保供出口节点名 -> 需求量（非负整数） */
+  outletDemands: Record<string, number>;
+}
+
+/** 最小割项目类型：供水点供给上限 / 连通管段 / 出口需求。 */
+export type CapacityCutKind = 'supply' | 'pipe' | 'demand';
+
+export interface CapacityCutItem {
+  kind: CapacityCutKind;
+  /** 供给上限与出口需求为节点名，管段为管段（含阀门）编号 */
+  id: string;
+  /** 该项对总供给的限制容量：上限值 / 1 / 需求量 */
+  capacity: number;
+}
+
+export interface CapacitySupplyRow {
+  supply: string;
+  cap: number;
+  /** 最大分配下该供水点实际供出量 */
+  used: number;
+}
+
+export interface CapacityOutletRow {
+  outlet: string;
+  demand: number;
+  /** 最大分配下该出口获配量 */
+  allocated: number;
+  /** 缺口 = 需求量 - 获配量 */
+  shortfall: number;
+  fullySupplied: boolean;
+}
+
+export interface CapacityOk {
+  status: 'ok';
+  /** 参与输水的管段总数（无阀管段 + 当前开启的带阀管段；自环不计） */
+  activePipeCount: number;
+  totalSupplyCap: number;
+  totalDemand: number;
+  /** 总供给最大分配（最大流） */
+  totalAllocated: number;
+  /** 总缺口 = 总需求 - 总获配 */
+  totalShortfall: number;
+  supplyRows: CapacitySupplyRow[];
+  rows: CapacityOutletRow[];
+  /**
+   * 一组限制总供给的最小割项目（容量合计恒等于总获配）。
+   * 最大流为 0 时为空清单。
+   */
+  cutItems: CapacityCutItem[];
+  cutCapacity: number;
+}
+
+export interface CapacityInvalid {
+  status: 'invalid';
+  errors: string[];
+}
+
+export type CapacityResult = CapacityOk | CapacityInvalid;
+
 /** 参与组合的开启阀门数量上限 */
 export const MAX_OPEN_VALVES = 12;
 /** 收集的最优方案数上限（防止结果爆炸） */
@@ -578,4 +646,353 @@ export function inspectResilience(network: Network, query: Query): ResilienceRes
   });
 
   return { status: 'ok', activePipeCount: edges.length, rows };
+}
+
+/**
+ * 带「双向合计容量」无向边的 Dinic。
+ *
+ * 与韧性巡检使用的 addUndirectedUnit（两个方向各放一条独立容量弧，
+ * 两方向可同时各占 1）不同，这里的无向管段在两个方向上**共享同一份容量**：
+ * 正/反弧初始容量均为 1，且增广推流后两弧容量之和恒为 1，
+ * 因此同一无向管段在任意流分配中双向合计至多占用一次（净流量绝对值 ≤ 1）。
+ */
+class CapacityDinic {
+  private readonly head: number[];
+  private readonly next: number[] = [];
+  private readonly from: number[] = [];
+  private readonly to: number[] = [];
+  private readonly cap: number[] = [];
+  private readonly initialCap: number[] = [];
+  private readonly level: number[];
+  private readonly it: number[];
+
+  constructor(private readonly n: number) {
+    this.head = new Array(n + 2).fill(-1);
+    this.level = new Array(n + 2).fill(-1);
+    this.it = new Array(n + 2).fill(0);
+  }
+
+  get source(): number {
+    return this.n;
+  }
+
+  get sink(): number {
+    return this.n + 1;
+  }
+
+  /** 增加一条有向弧（自动附带零容量反向弧），返回正向弧下标。 */
+  addArc(u: number, v: number, cap: number): number {
+    this.next.push(this.head[u]);
+    this.from.push(u);
+    this.to.push(v);
+    this.cap.push(cap);
+    this.initialCap.push(cap);
+    this.head[u] = this.next.length - 1;
+    const fwd = this.next.length - 1;
+
+    this.next.push(this.head[v]);
+    this.from.push(v);
+    this.to.push(u);
+    this.cap.push(0);
+    this.initialCap.push(0);
+    this.head[v] = this.next.length - 1;
+    return fwd;
+  }
+
+  /**
+   * 无向共享容量边：两弧初始容量均为 cap，配对弧更新只做净流量记账，
+   * 全程保持 cap[a] + cap[a^1] === cap，双向合计占用不超过 cap（管段为 1）。
+   * 返回正向弧（u→v）的下标，供割判定与流量读取使用。
+   */
+  addUndirectedShared(u: number, v: number, cap: number): number {
+    this.next.push(this.head[u]);
+    this.from.push(u);
+    this.to.push(v);
+    this.cap.push(cap);
+    this.initialCap.push(cap);
+    this.head[u] = this.next.length - 1;
+    const fwd = this.next.length - 1;
+
+    this.next.push(this.head[v]);
+    this.from.push(v);
+    this.to.push(u);
+    this.cap.push(cap);
+    this.initialCap.push(cap);
+    this.head[v] = this.next.length - 1;
+    return fwd;
+  }
+
+  /** 弧 a 起点。 */
+  arcFrom(a: number): number {
+    return this.from[a];
+  }
+
+  /** 弧 a 终点。 */
+  arcTo(a: number): number {
+    return this.to[a];
+  }
+
+  /** 弧 a 的剩余容量。 */
+  residualCap(a: number): number {
+    return this.cap[a];
+  }
+
+  /** 弧 a 的初始容量。 */
+  initialArcCap(a: number): number {
+    return this.initialCap[a];
+  }
+
+  /** 弧 a 已承载的流量（初始容量 - 剩余容量；共享无向边反向弧可能为负，表示反向净流）。 */
+  arcFlow(a: number): number {
+    return this.initialCap[a] - this.cap[a];
+  }
+
+  private bfs(s: number, t: number): boolean {
+    this.level.fill(-1);
+    this.level[s] = 0;
+    const queue = [s];
+    while (queue.length > 0) {
+      const u = queue.shift()!;
+      for (let a = this.head[u]; a !== -1; a = this.next[a]) {
+        if (this.cap[a] > 0 && this.level[this.to[a]] === -1) {
+          this.level[this.to[a]] = this.level[u] + 1;
+          queue.push(this.to[a]);
+        }
+      }
+    }
+    return this.level[t] !== -1;
+  }
+
+  private dfs(u: number, t: number, pushed: number): number {
+    if (u === t || pushed === 0) return pushed;
+    while (this.it[u] !== -1) {
+      const a = this.it[u];
+      const v = this.to[a];
+      if (this.cap[a] > 0 && this.level[v] === this.level[u] + 1) {
+        const flow = this.dfs(v, t, Math.min(pushed, this.cap[a]));
+        if (flow > 0) {
+          this.cap[a] -= flow;
+          this.cap[a ^ 1] += flow;
+          return flow;
+        }
+      }
+      this.it[u] = this.next[a];
+    }
+    return 0;
+  }
+
+  maxFlow(s: number, t: number): number {
+    let flow = 0;
+    while (this.bfs(s, t)) {
+      for (let i = 0; i < this.it.length; i++) this.it[i] = this.head[i];
+      while (true) {
+        const pushed = this.dfs(s, t, Infinity);
+        if (pushed === 0) break;
+        flow += pushed;
+      }
+    }
+    return flow;
+  }
+
+  /** 最大流后源侧可达节点集合（残量网络 BFS），即标准 s-t 最小割的源侧。 */
+  sourceSideCut(s: number): boolean[] {
+    const inSourceSide = new Array(this.n + 2).fill(false);
+    inSourceSide[s] = true;
+    const queue = [s];
+    while (queue.length > 0) {
+      const u = queue.shift()!;
+      for (let a = this.head[u]; a !== -1; a = this.next[a]) {
+        const v = this.to[a];
+        if (this.cap[a] > 0 && !inSourceSide[v]) {
+          inSourceSide[v] = true;
+          queue.push(v);
+        }
+      }
+    }
+    return inSourceSide;
+  }
+}
+
+/** 非负整数校验：必须为整数且 ≥ 0；拒绝 1.5、-1、NaN、Infinity。 */
+function readNonNegativeInt(value: unknown): { ok: true; n: number } | { ok: false } {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    return { ok: false };
+  }
+  return { ok: true, n: value };
+}
+
+/**
+ * 供水能力核验：在当前阀门开闭状态下，按各供水点供给上限、各保供出口需求量，
+ * 求「总供给最大分配」（单源单汇最大流），给出每个出口的获配量与缺口，
+ * 并给出一组限制总供给的最小割项目（供给上限 / 连通管段 / 出口需求）。
+ *
+ * 建模：
+ * - 超级源点 → 供水点：容量为该供水点的供给上限；
+ * - 每条无阀管段与当前开启的带阀管段：双向共享容量 1 的无向边，
+ *   同一管段双向合计只能占用一次，已关阀不参与；
+ * - 出口 → 超级汇点：容量为该出口的需求量。
+ * 多供水点上限与多出口需求经最大流同时约束。最小割中饱和跨越的弧即瓶颈项目。
+ * 纯函数，不修改输入。
+ */
+export function verifyCapacity(network: Network, query: CapacityQuery): CapacityResult {
+  const errors: string[] = [];
+  const nodeSet = new Set(network.nodes);
+
+  if (query.supplies.length === 0) errors.push('至少需要指定一个供水点。');
+  for (const s of query.supplies) {
+    if (!nodeSet.has(s)) errors.push(`供水点「${s}」不在节点列表中。`);
+  }
+  if (query.outlets.length === 0) errors.push('至少需要指定一个保供出口。');
+  for (const o of query.outlets) {
+    if (!nodeSet.has(o)) errors.push(`保供出口「${o}」不在节点列表中。`);
+  }
+
+  const supplies = uniquePreservingOrder(query.supplies);
+  const outlets = uniquePreservingOrder(query.outlets);
+
+  const supplyCapList: { supply: string; cap: number }[] = [];
+  for (const s of supplies) {
+    if (!nodeSet.has(s)) continue;
+    const raw = query.supplyCaps[s];
+    if (raw === undefined) {
+      errors.push(`供水点「${s}」缺少供给上限，请填写非负整数。`);
+      continue;
+    }
+    const parsed = readNonNegativeInt(raw);
+    if (!parsed.ok) {
+      errors.push(`供水点「${s}」的供给上限必须是非负整数（收到：${String(raw)}）。`);
+      continue;
+    }
+    supplyCapList.push({ supply: s, cap: parsed.n });
+  }
+
+  const demandList: { outlet: string; demand: number }[] = [];
+  for (const o of outlets) {
+    if (!nodeSet.has(o)) continue;
+    const raw = query.outletDemands[o];
+    if (raw === undefined) {
+      errors.push(`保供出口「${o}」缺少需求量，请填写非负整数。`);
+      continue;
+    }
+    const parsed = readNonNegativeInt(raw);
+    if (!parsed.ok) {
+      errors.push(`保供出口「${o}」的需求量必须是非负整数（收到：${String(raw)}）。`);
+      continue;
+    }
+    demandList.push({ outlet: o, demand: parsed.n });
+  }
+
+  if (errors.length > 0) return { status: 'invalid', errors };
+
+  const edges = collectActiveEdges(network);
+  const indexOf = new Map<string, number>();
+  network.nodes.forEach((node, i) => indexOf.set(node, i));
+
+  const dinic = new CapacityDinic(network.nodes.length);
+  const S = dinic.source;
+  const T = dinic.sink;
+
+  // 记录每条瓶颈候选弧，供最小割项目归集
+  const supplyArcIndex = new Map<number, { supply: string; cap: number }>();
+  for (const { supply, cap } of supplyCapList) {
+    const u = indexOf.get(supply)!;
+    const arc = dinic.addArc(S, u, cap);
+    supplyArcIndex.set(arc, { supply, cap });
+  }
+
+  interface PipeArc {
+    id: string;
+    fwdArc: number;
+  }
+  const pipeArcs: PipeArc[] = [];
+  for (const e of edges) {
+    const u = indexOf.get(e.from)!;
+    const v = indexOf.get(e.to)!;
+    const fwdArc = dinic.addUndirectedShared(u, v, 1);
+    pipeArcs.push({ id: e.id, fwdArc });
+  }
+
+  const demandArcIndex = new Map<number, { outlet: string; demand: number }>();
+  for (const { outlet, demand } of demandList) {
+    const v = indexOf.get(outlet)!;
+    const arc = dinic.addArc(v, T, demand);
+    demandArcIndex.set(arc, { outlet, demand });
+  }
+
+  const totalAllocated = dinic.maxFlow(S, T);
+  const inSourceSide = dinic.sourceSideCut(S);
+
+  // 各供水点实际供出量 = 其源点弧上的流量
+  const supplyRows: CapacitySupplyRow[] = supplyCapList.map(({ supply, cap }) => {
+    let used = 0;
+    for (const [arc, info] of supplyArcIndex) {
+      if (info.supply === supply) used += dinic.arcFlow(arc);
+    }
+    return { supply, cap, used };
+  });
+
+  // 各出口获配量 = 其汇点弧上的流量
+  const outletFlow = new Map<string, number>();
+  for (const [arc, info] of demandArcIndex) {
+    outletFlow.set(info.outlet, dinic.arcFlow(arc));
+  }
+
+  const rows: CapacityOutletRow[] = demandList.map(({ outlet, demand }) => {
+    const allocated = outletFlow.get(outlet) ?? 0;
+    return {
+      outlet,
+      demand,
+      allocated,
+      shortfall: demand - allocated,
+      fullySupplied: allocated >= demand,
+    };
+  });
+
+  // 最小割项目：饱和跨越源侧→汇侧的弧（容量为 0 的弧恒饱和但不构成实际限制，排除）
+  const isCrossing = (arc: number): boolean =>
+    inSourceSide[dinic.arcFrom(arc)] &&
+    !inSourceSide[dinic.arcTo(arc)] &&
+    dinic.residualCap(arc) === 0 &&
+    dinic.initialArcCap(arc) > 0;
+
+  const cutItems: CapacityCutItem[] = [];
+  for (const [arc, info] of supplyArcIndex) {
+    if (isCrossing(arc)) {
+      cutItems.push({ kind: 'supply', id: info.supply, capacity: info.cap });
+    }
+  }
+  for (const pa of pipeArcs) {
+    // 无向共享边：任一方向弧饱和跨越割线即该管段受限（两弧至多一条满足）
+    if (isCrossing(pa.fwdArc) || isCrossing(pa.fwdArc ^ 1)) {
+      cutItems.push({ kind: 'pipe', id: pa.id, capacity: 1 });
+    }
+  }
+  for (const [arc, info] of demandArcIndex) {
+    if (isCrossing(arc)) {
+      cutItems.push({ kind: 'demand', id: info.outlet, capacity: info.demand });
+    }
+  }
+  // 排序：类型固定顺序（供给→管段→需求），同类按名称/编号，便于阅读与对照
+  const kindOrder: Record<CapacityCutKind, number> = { supply: 0, pipe: 1, demand: 2 };
+  cutItems.sort((a, b) => {
+    if (kindOrder[a.kind] !== kindOrder[b.kind]) return kindOrder[a.kind] - kindOrder[b.kind];
+    return a.id.localeCompare(b.id, 'zh-Hans-CN');
+  });
+
+  const totalSupplyCap = supplyCapList.reduce((sum, x) => sum + x.cap, 0);
+  const totalDemand = demandList.reduce((sum, x) => sum + x.demand, 0);
+  const cutCapacity = cutItems.reduce((sum, x) => sum + x.capacity, 0);
+
+  return {
+    status: 'ok',
+    activePipeCount: edges.length,
+    totalSupplyCap,
+    totalDemand,
+    totalAllocated,
+    totalShortfall: totalDemand - totalAllocated,
+    supplyRows,
+    rows,
+    cutItems,
+    cutCapacity,
+  };
 }

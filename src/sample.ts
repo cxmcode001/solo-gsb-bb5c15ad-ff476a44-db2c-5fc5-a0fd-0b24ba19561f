@@ -38,3 +38,16 @@ export const SAMPLE_QUERY: Query = {
   leak: '环管N2',
   outlets: ['展厅B', '咖啡厅', '卫生间'],
 };
+
+/** 示例供水能力核验数值：各供水点供给上限（非负整数）。 */
+export const SAMPLE_SUPPLY_CAPS: Record<string, number> = {
+  市政供水S1: 5,
+  备用水箱S2: 3,
+};
+
+/** 示例供水能力核验数值：各保供出口需求量（非负整数）。 */
+export const SAMPLE_OUTLET_DEMANDS: Record<string, number> = {
+  展厅B: 2,
+  咖啡厅: 1,
+  卫生间: 2,
+};

@@ -210,5 +210,184 @@ check('巡检不修改输入网络', JSON.stringify(network) === beforeInsp);
 const ir10 = solver.inspectResilience(many.network, { supplies: ['a'], leak: '', outlets: ['b'] });
 check('巡检不受开启阀门 12 个上限影响', ir10.status === 'ok' && ir10.rows[0].minFailures === 13);
 
+// ============ 供水能力核验 ============
+console.log('供水能力核验：');
+
+const cap = (supplies, outlets, supplyCaps, outletDemands) =>
+  solver.verifyCapacity(network, { supplies, outlets, supplyCaps, outletDemands });
+const capRow = (r, name) => r.rows.find((x) => x.outlet === name);
+const capKinds = (r) => r.cutItems.map((c) => `${c.kind}:${c.id}=${c.capacity}`).join('|');
+
+// 基本场景：S1/S2 各仅一条单位管接入环网（V01/V02），总入环能力 2；
+// B 挂单管 V08（V09 已关）最多获配 1
+const c1 = cap(
+  ['S1', 'S2'],
+  ['B', 'C', 'D'],
+  { S1: 5, S2: 3 },
+  { B: 2, C: 1, D: 1 }
+);
+check('核验返回 ok', c1.status === 'ok');
+check('总获配为 2（受两条供水接入管 V01/V02 限制）', c1.totalAllocated === 2);
+check('总缺口为 2（B 缺 1、C 或 D 缺 1）', c1.totalShortfall === 2);
+check('B 获配 1、缺口 1（V09 已关，仅 V08 单管）', capRow(c1, 'B').allocated === 1 && capRow(c1, 'B').shortfall === 1);
+check('C、D 合计获配 1', capRow(c1, 'C').allocated + capRow(c1, 'D').allocated === 1);
+check('最小割容量合计等于总获配', c1.cutCapacity === 2);
+check('最小割为两条供水接入管 V01、V02', c1.cutItems.length === 2 &&
+  c1.cutItems.every((x) => x.kind === 'pipe') &&
+  c1.cutItems.map((x) => x.id).sort().join(',') === 'V01,V02');
+check('割中不含已关阀 V09', !c1.cutItems.some((x) => x.id === 'V09'));
+
+console.log('核验：供给上限成为瓶颈：');
+// 供水点直接以并行大通道接出（13 条并行单位管），出口需求很大，
+// 此时总获配只受供给上限制约
+const bigNet = {
+  nodes: ['SA', 'SB', 'O'],
+  pipes: [],
+  valvedPipes: [
+    ...Array.from({ length: 13 }, (_, i) => ({ id: `VA${i}`, from: 'SA', to: 'O', open: true })),
+    ...Array.from({ length: 13 }, (_, i) => ({ id: `VB${i}`, from: 'SB', to: 'O', open: true })),
+  ],
+};
+const c2 = solver.verifyCapacity(bigNet, {
+  supplies: ['SA', 'SB'], outlets: ['O'],
+  supplyCaps: { SA: 2, SB: 1 }, outletDemands: { O: 100 },
+});
+check('总获配受限于供给上限合计 3', c2.totalAllocated === 3);
+check('最小割为两条供给上限（容量 2+1）', c2.cutItems.length === 2 &&
+  c2.cutItems.every((x) => x.kind === 'supply') && c2.cutCapacity === 3);
+
+console.log('核验：出口需求成为瓶颈（全部足额）：');
+const c3net = {
+  nodes: ['SA', 'SB', 'OA', 'OB', 'OC'],
+  pipes: [],
+  valvedPipes: [
+    ...Array.from({ length: 9 }, (_, i) => ({ id: `VA${i}`, from: 'SA', to: 'OA', open: true })),
+    ...Array.from({ length: 9 }, (_, i) => ({ id: `VB${i}`, from: 'SB', to: 'OB', open: true })),
+    ...Array.from({ length: 9 }, (_, i) => ({ id: `VC${i}`, from: 'SA', to: 'OC', open: true })),
+  ],
+};
+const c3 = solver.verifyCapacity(c3net, {
+  supplies: ['SA', 'SB'], outlets: ['OA', 'OB', 'OC'],
+  supplyCaps: { SA: 5, SB: 5 }, outletDemands: { OA: 1, OB: 1, OC: 1 },
+});
+check('总获配等于总需求 3', c3.totalAllocated === 3 && c3.totalShortfall === 0);
+check('最小割为三个出口需求', c3.cutItems.length === 3 &&
+  c3.cutItems.every((x) => x.kind === 'demand') && c3.cutCapacity === 3);
+check('全部出口标记足额', c3.rows.every((x) => x.fullySupplied));
+
+console.log('核验：已关阀不参与、断水出口获配 0：');
+const cutCapNet = {
+  nodes: ['S', 'X', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'X', open: true },
+    { id: 'V2', from: 'X', to: 'O', open: false },
+  ],
+};
+const c4 = solver.verifyCapacity(cutCapNet, {
+  supplies: ['S'], outlets: ['O'],
+  supplyCaps: { S: 5 }, outletDemands: { O: 3 },
+});
+check('仅经已关阀连接时获配 0、缺口 3', c4.status === 'ok' &&
+  c4.totalAllocated === 0 && c4.rows[0].allocated === 0 && c4.rows[0].shortfall === 3);
+check('参与输水管段仅 1 条（V2 已关排除）', c4.activePipeCount === 1);
+check('总获配 0 时割清单为空', c4.cutItems.length === 0 && c4.cutCapacity === 0);
+
+console.log('核验：同一无向管段双向合计只能占用一次：');
+// S1—M—S2 为一条单位管，O 从 M 经一条单位管取水：
+// 无论 S1、S2 上限多大，M→O 单管使每个出口侧最多 1；
+// 关键：S1 与 S2 之间的共享管段不能同时双向各占 1
+const sharedNet = {
+  nodes: ['S1', 'S2', 'M', 'O'],
+  pipes: [{ id: 'P1', from: 'M', to: 'O' }],
+  valvedPipes: [
+    { id: 'V1', from: 'S1', to: 'M', open: true },
+    { id: 'V2', from: 'S2', to: 'M', open: true },
+  ],
+};
+const c5 = solver.verifyCapacity(sharedNet, {
+  supplies: ['S1', 'S2'], outlets: ['O'],
+  supplyCaps: { S1: 5, S2: 5 }, outletDemands: { O: 5 },
+});
+check('两个供水点合计最多经 P1 供出 1', c5.totalAllocated === 1);
+check('最小割为管段 P1', c5.cutItems.length === 1 && c5.cutItems[0].kind === 'pipe' && c5.cutItems[0].id === 'P1');
+
+console.log('核验：环路提供两条单位通道：');
+// S—N1—N2—O 与 S—N3—N2—O 构成双路径 → O 最多获配 2
+const ringNet = {
+  nodes: ['S', 'N1', 'N3', 'N2', 'O'],
+  pipes: [{ id: 'P1', from: 'N2', to: 'O' }],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'N1', open: true },
+    { id: 'V2', from: 'N1', to: 'N2', open: true },
+    { id: 'V3', from: 'S', to: 'N3', open: true },
+    { id: 'V4', from: 'N3', to: 'N2', open: true },
+  ],
+};
+const c6 = solver.verifyCapacity(ringNet, {
+  supplies: ['S'], outlets: ['O'],
+  supplyCaps: { S: 9 }, outletDemands: { O: 9 },
+});
+check('双路径 + 出口单管 → 获配 1（P1 瓶颈）', c6.totalAllocated === 1 &&
+  c6.cutItems.some((x) => x.kind === 'pipe' && x.id === 'P1'));
+// 出口再加一条并行管 → 2
+const ringNet2 = {
+  nodes: ['S', 'N1', 'N3', 'N2', 'O'],
+  pipes: [
+    { id: 'P1', from: 'N2', to: 'O' },
+    { id: 'P2', from: 'N1', to: 'O' },
+  ],
+  valvedPipes: ringNet.valvedPipes,
+};
+const c7 = solver.verifyCapacity(ringNet2, {
+  supplies: ['S'], outlets: ['O'],
+  supplyCaps: { S: 9 }, outletDemands: { O: 9 },
+});
+check('环路两路径 + 两并行出口管 → 获配 2', c7.totalAllocated === 2 && c7.cutCapacity === 2);
+
+console.log('核验：零上限 / 零需求：');
+const c8 = cap(['S1', 'S2'], ['B', 'C'], { S1: 0, S2: 0 }, { B: 2, C: 2 });
+check('供给上限全为 0 时获配 0', c8.totalAllocated === 0);
+check('零上限弧不进入割清单', c8.cutItems.length === 0);
+const c9 = cap(['S1'], ['B', 'C'], { S1: 5 }, { B: 0, C: 0 });
+check('需求全为 0 时获配 0、缺口 0', c9.totalAllocated === 0 && c9.totalShortfall === 0);
+check('零需求弧不进入割清单', c9.cutItems.length === 0);
+// 混合：B 需求 0（挂在 S1 旁），C 经单管需求 2 → 割只含管段，不含零需求 B
+const zeroMixNet = {
+  nodes: ['S1', 'B', 'C'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V0', from: 'S1', to: 'B', open: true },
+    { id: 'V1', from: 'S1', to: 'C', open: true },
+  ],
+};
+const c9b = solver.verifyCapacity(zeroMixNet, {
+  supplies: ['S1'], outlets: ['B', 'C'],
+  supplyCaps: { S1: 5 }, outletDemands: { B: 0, C: 2 },
+});
+check('零需求出口不产生割项，瓶颈仅为 V1', c9b.totalAllocated === 1 &&
+  c9b.cutItems.map((x) => x.id).join(',') === 'V1');
+
+console.log('核验：纯函数与输入校验：');
+const beforeCap = JSON.stringify(network);
+cap(['S1', 'S2'], ['B'], { S1: 2, S2: 2 }, { B: 3 });
+check('核验不修改输入网络与数值表', JSON.stringify(network) === beforeCap);
+const ce1 = cap(['NOPE'], ['B'], { NOPE: 1 }, { B: 1 });
+check('供水点不存在时报错', ce1.status === 'invalid');
+const ce2 = cap(['S1'], ['NOPE'], { S1: 1 }, { NOPE: 1 });
+check('出口不存在时报错', ce2.status === 'invalid');
+const ce3 = cap([], ['B'], {}, { B: 1 });
+check('缺少供水点时报错', ce3.status === 'invalid');
+const ce4 = cap(['S1'], [], { S1: 1 }, {});
+check('缺少出口时报错', ce4.status === 'invalid');
+const ce5 = cap(['S1'], ['B'], { S1: -1 }, { B: 1 });
+check('负整数上限被拒绝', ce5.status === 'invalid' && ce5.errors.some((e) => e.includes('非负整数')));
+const ce6 = cap(['S1'], ['B'], { S1: 1.5 }, { B: 1 });
+check('小数上限被拒绝', ce6.status === 'invalid');
+const ce7 = cap(['S1'], ['B'], {}, { B: 1 });
+check('缺少某供水点上限被拒绝', ce7.status === 'invalid');
+const ce8 = cap(['S1'], ['B'], { S1: 1 }, { B: '2' });
+check('字符串需求量被拒绝', ce8.status === 'invalid');
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);
