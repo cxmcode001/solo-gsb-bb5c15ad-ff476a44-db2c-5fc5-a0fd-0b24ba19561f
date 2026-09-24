@@ -58,6 +58,12 @@ main {
   align-content: start;
 }
 
+.input-column {
+  display: grid;
+  gap: 16px;
+  align-content: start;
+}
+
 .button-row {
   display: flex;
   flex-wrap: wrap;
@@ -105,6 +111,31 @@ textarea {
   border: 1px solid var(--border);
   border-radius: 6px;
   background: #fbfcfe;
+}
+
+textarea.small {
+  min-height: 64px;
+  height: auto;
+  font-family: inherit;
+  font-size: 0.92rem;
+}
+
+.table-title {
+  margin: 16px 0 0;
+  font-size: 0.98rem;
+}
+
+.banner-sub {
+  display: block;
+  margin-top: 4px;
+  font-weight: 400;
+  font-size: 0.86rem;
+}
+
+.banner.warn {
+  background: #fef3e2;
+  border: 1px solid #f5d49b;
+  color: #b45309;
 }
 
 .fields {

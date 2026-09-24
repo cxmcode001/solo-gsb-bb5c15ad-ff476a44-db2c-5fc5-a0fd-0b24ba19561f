@@ -210,5 +210,209 @@ check('巡检不修改输入网络', JSON.stringify(network) === beforeInsp);
 const ir10 = solver.inspectResilience(many.network, { supplies: ['a'], leak: '', outlets: ['b'] });
 check('巡检不受开启阀门 12 个上限影响', ir10.status === 'ok' && ir10.rows[0].minFailures === 13);
 
+// 不受 12 个开启阀门上限影响（核验同样为多项式最大流，不受组合枚举上限约束；见下方核验分区断言）
+void many;
+
+// ============ 供水能力核验 ============
+console.log('供水能力核验：');
+
+const findCapRow = (r, name) => r.rows.find((x) => x.outlet === name);
+const groupKinds = (r) => r.cutGroups.map((g) => g.kind);
+const groupOf = (r, kind) => r.cutGroups.find((g) => g.kind === kind);
+
+console.log('核验：单管串联与供给上限约束：');
+const chainNet = {
+  nodes: ['S1', 'M', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S1', to: 'M', open: true },
+    { id: 'V2', from: 'M', to: 'O', open: true },
+  ],
+};
+// 供给上限 1 卡总供给：割为供给上限 1
+const c1 = solver.verifyCapacity(chainNet, { supplyCaps: { S1: 1 }, outletDemands: { O: 3 } });
+check('返回 ok', c1.status === 'ok');
+check('总分配为 1、总缺口为 2', c1.totalAllocated === 1 && c1.totalGap === 2);
+check('出口 O 获配 1、缺口 2、可达', (() => {
+  const row = findCapRow(c1, 'O');
+  return row.demand === 3 && row.allocated === 1 && row.gap === 2 && row.reachable === true;
+})());
+check('最小割为供给上限 S1（容量 1）', groupKinds(c1).join(',') === 'supply' &&
+  groupOf(c1, 'supply').items.join(',') === 'S1' && groupOf(c1, 'supply').capacity === 1);
+check('割容量等于总分配量', c1.cutCapacity === c1.totalAllocated);
+
+console.log('核验：管段容量约束：');
+// 供给充裕但串联管段每条容量 1
+const c2 = solver.verifyCapacity(chainNet, { supplyCaps: { S1: 5 }, outletDemands: { O: 5 } });
+check('总分配受单根管段限制为 1、缺口 4', c2.totalAllocated === 1 && c2.totalGap === 4);
+check('最小割为管段 V1（容量 1）', groupKinds(c2).join(',') === 'pipe' &&
+  groupOf(c2, 'pipe').items.join(',') === 'V1' && groupOf(c2, 'pipe').capacity === 1);
+
+console.log('核验：出口需求约束（并行管段可绕过管容）：');
+const par2Net = {
+  nodes: ['S', 'O'],
+  pipes: [
+    { id: 'P1', from: 'S', to: 'O' },
+    { id: 'P2', from: 'S', to: 'O' },
+  ],
+  valvedPipes: [],
+};
+const c3 = solver.verifyCapacity(par2Net, { supplyCaps: { S: 5 }, outletDemands: { O: 1 } });
+check('需求仅 1 时总分配 1、缺口 0', c3.totalAllocated === 1 && c3.totalGap === 0);
+check('最小割为出口需求 O（容量 1）', groupKinds(c3).join(',') === 'outlet' &&
+  groupOf(c3, 'outlet').items.join(',') === 'O');
+// 需求大于 2 条并行管容量时受管段限制
+const c3b = solver.verifyCapacity(par2Net, { supplyCaps: { S: 5 }, outletDemands: { O: 5 } });
+check('需求 5 时总分配 2（两条并行管各计 1）', c3b.totalAllocated === 2 && c3b.totalGap === 3);
+check('最小割为两条并行管段（容量 2）', groupKinds(c3b).join(',') === 'pipe' &&
+  groupOf(c3b, 'pipe').items.join(',') === 'P1,P2' && groupOf(c3b, 'pipe').capacity === 2);
+
+console.log('核验：多供水点上限与多出口需求同时约束：');
+// 环形测试网：S1、S2 经各自单管 V01/V02 接入环，B/C/D 各经单管挂环
+const c4 = solver.verifyCapacity(network, {
+  supplyCaps: { S1: 2, S2: 1 },
+  outletDemands: { B: 1, C: 1, D: 1 },
+});
+check('总分配 2（V01+V02 各只能过 1）、总缺口 1', c4.totalAllocated === 2 && c4.totalGap === 1);
+check('供给上限合计 3、需求合计 3', c4.totalSupplyCap === 3 && c4.totalDemand === 3);
+check('三个出口各获配 0 或 1，获配合计 2', c4.rows.every((x) => [0, 1].includes(x.allocated)) &&
+  c4.rows.reduce((s, x) => s + x.allocated, 0) === 2);
+check('缺口合计等于总缺口', c4.rows.reduce((s, x) => s + x.gap, 0) === c4.totalGap);
+check('割中同时含供给上限与管段两类项目', groupKinds(c4).includes('supply') && groupKinds(c4).includes('pipe'));
+check('割容量等于总分配量', c4.cutCapacity === 2 && c4.cutCapacity === c4.totalAllocated);
+
+console.log('核验：多源多汇分支网（供给上限同时卡总分配）：');
+const diamondNet = {
+  nodes: ['S1', 'S2', 'M', 'O1', 'O2'],
+  pipes: [
+    { id: 'P1', from: 'S1', to: 'M' },
+    { id: 'P2', from: 'S2', to: 'M' },
+    { id: 'P3', from: 'M', to: 'O1' },
+    { id: 'P4', from: 'M', to: 'O2' },
+  ],
+  valvedPipes: [],
+};
+const c5 = solver.verifyCapacity(diamondNet, {
+  supplyCaps: { S1: 1, S2: 1 },
+  outletDemands: { O1: 2, O2: 2 },
+});
+check('总分配 2、总缺口 2', c5.totalAllocated === 2 && c5.totalGap === 2);
+check('O1、O2 各获配 1', findCapRow(c5, 'O1').allocated === 1 && findCapRow(c5, 'O2').allocated === 1);
+check('最小割为两个供水点供给上限（容量 2）', groupKinds(c5).join(',') === 'supply' &&
+  groupOf(c5, 'supply').items.join(',') === 'S1,S2');
+
+console.log('核验：已关阀不参与、断水出口获配 0：');
+const cutValveNet = {
+  nodes: ['S', 'X', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'X', open: true },
+    { id: 'V2', from: 'X', to: 'O', open: false },
+  ],
+};
+const c6 = solver.verifyCapacity(cutValveNet, { supplyCaps: { S: 5 }, outletDemands: { O: 2 } });
+check('连通管段数仅 1（已关 V2 不计）', c6.activePipeCount === 1);
+check('总分配 0、缺口等于需求', c6.totalAllocated === 0 && c6.totalGap === 2);
+check('出口标记不可达、获配 0、缺口 2', (() => {
+  const row = findCapRow(c6, 'O');
+  return row.allocated === 0 && row.gap === 2 && row.reachable === false;
+})());
+check('割为空清单', Array.isArray(c6.cutGroups) && c6.cutGroups.length === 0);
+
+console.log('核验：零上限供水点与零需求出口不列入割：');
+const zeroNet = {
+  nodes: ['S1', 'S2', 'O1', 'O2'],
+  pipes: [{ id: 'P1', from: 'S1', to: 'O1' }],
+  valvedPipes: [{ id: 'V1', from: 'S2', to: 'O2', open: true }],
+};
+const c7 = solver.verifyCapacity(zeroNet, {
+  supplyCaps: { S1: 0, S2: 3 },
+  outletDemands: { O1: 0, O2: 2 },
+});
+check('总分配 1（V1 单管容量 1）', c7.totalAllocated === 1);
+check('O1 需求 0 获配 0 缺口 0', (() => { const r = findCapRow(c7, 'O1'); return r.demand === 0 && r.allocated === 0 && r.gap === 0; })());
+check('割中不含零容量供给上限/需求，仅管段 V1', groupKinds(c7).join(',') === 'pipe' &&
+  groupOf(c7, 'pipe').items.join(',') === 'V1');
+
+console.log('核验：出口与供水点同名：');
+const sameNet = {
+  nodes: ['S1', 'O'],
+  pipes: [{ id: 'P1', from: 'S1', to: 'O' }],
+  valvedPipes: [],
+};
+// S1 同时是供水点与出口：其供给上限同时约束自身获配与外送
+const c8 = solver.verifyCapacity(sameNet, { supplyCaps: { S1: 3 }, outletDemands: { S1: 2, O: 1 } });
+check('同名节点 S1 直接获配 2，另一个出口经单管获配 1', c8.totalAllocated === 3 &&
+  findCapRow(c8, 'S1').allocated === 2 && findCapRow(c8, 'O').allocated === 1);
+check('全部满足，总缺口 0', c8.totalGap === 0);
+// 供给上限同时要供自身与外送时也构成约束：上限 2、自身需求 2，外送口得不到水
+const c8b = solver.verifyCapacity(sameNet, { supplyCaps: { S1: 2 }, outletDemands: { S1: 2, O: 1 } });
+check('同名节点供给上限同时约束自身与外送（自身 2、O 获配 0）', c8b.totalAllocated === 2 &&
+  findCapRow(c8b, 'S1').allocated === 2 && findCapRow(c8b, 'O').allocated === 0);
+
+console.log('核验：同一无向管段双向合计只占用一次（菱形换向）：');
+// S1、S2 两源与 O1、O2 两口，中间仅靠一条管段 M? 构造：
+// S1-M (P1), S2-M (P2), M-O1 (P3), M-O2 (P4) 已验证两侧各 1；
+// 这里再验证相向汇流场景：S1-O1 与 S2-O2 若共用一条边也只能过 1
+const crossNet = {
+  nodes: ['S1', 'S2', 'M', 'O'],
+  pipes: [
+    { id: 'P1', from: 'S1', to: 'M' },
+    { id: 'P2', from: 'M', to: 'O' },
+  ],
+  valvedPipes: [
+    { id: 'V1', from: 'S2', to: 'M', open: true },
+  ],
+};
+const c9 = solver.verifyCapacity(crossNet, {
+  supplyCaps: { S1: 1, S2: 1 },
+  outletDemands: { O: 2 },
+});
+check('两源经汇集点 M 再过单管 P2：总分配 1（P2 双向合计容量 1）', c9.totalAllocated === 1 && c9.totalGap === 1);
+
+console.log('核验：纯函数不修改输入：');
+const beforeCap = JSON.stringify(network);
+solver.verifyCapacity(network, { supplyCaps: { S1: 2, S2: 1 }, outletDemands: { B: 1, C: 1 } });
+check('核验后输入网络未变化', JSON.stringify(network) === beforeCap);
+
+console.log('核验：输入校验：');
+const cE1 = solver.verifyCapacity(network, { supplyCaps: {}, outletDemands: { B: 1 } });
+check('缺少供水点时报错', cE1.status === 'invalid');
+const cE2 = solver.verifyCapacity(network, { supplyCaps: { S1: 1 }, outletDemands: {} });
+check('缺少出口时报错', cE2.status === 'invalid');
+const cE3 = solver.verifyCapacity(network, { supplyCaps: { NOPE: 1 }, outletDemands: { B: 1 } });
+check('供水点不存在时报错', cE3.status === 'invalid');
+const cE4 = solver.verifyCapacity(network, { supplyCaps: { S1: 1 }, outletDemands: { NOPE: 1 } });
+check('出口不存在时报错', cE4.status === 'invalid');
+const cE5 = solver.verifyCapacity(network, { supplyCaps: { S1: -1 }, outletDemands: { B: 1 } });
+check('负的供给上限报错', cE5.status === 'invalid');
+const cE6 = solver.verifyCapacity(network, { supplyCaps: { S1: 1 }, outletDemands: { B: 1.5 } });
+check('非整数需求报错', cE6.status === 'invalid');
+
+console.log('核验：不受开启阀门 12 个上限影响：');
+// 13 条并行带阀管段（全开启）：核验为多项式最大流，13 条管容量 1 的并行边最多过 13
+const crMany = solver.verifyCapacity(many.network, { supplyCaps: { a: 13 }, outletDemands: { b: 13 } });
+check('13 个开启阀门下仍可核验且总分配 13', crMany.status === 'ok' && crMany.totalAllocated === 13);
+const crMany2 = solver.verifyCapacity(many.network, { supplyCaps: { a: 5 }, outletDemands: { b: 5 } });
+check('供给上限 5 / 需求 5 时总分配 5', crMany2.totalAllocated === 5);
+
+console.log('核验：名称数值清单解析：');
+const p1 = solver.parseAssignments('市政供水S1: 2, 备用水箱S2: 1', ['市政供水S1', '备用水箱S2']);
+check('逗号分隔 + 冒号空格', p1.errors.length === 0 && p1.values['市政供水S1'] === 2 && p1.values['备用水箱S2'] === 1);
+const p2 = solver.parseAssignments('A:1\nB:2;C：3', ['A', 'B', 'C']);
+check('换行/分号/全角冒号', p2.errors.length === 0 && p2.values.A === 1 && p2.values.B === 2 && p2.values.C === 3);
+const p3 = solver.parseAssignments('A, B', ['A', 'B']);
+check('只写名称按 1 计', p3.errors.length === 0 && p3.values.A === 1 && p3.values.B === 1);
+const p4 = solver.parseAssignments('A:-1, B:x', ['A', 'B']);
+check('负数与非数字被拒绝', p4.errors.length === 2 && p4.values.A === undefined);
+const p5 = solver.parseAssignments('A:1, C:2', ['A', 'B']);
+check('未知名称被拒绝', p5.errors.length === 1 && p5.values.A === 1);
+const p6 = solver.parseAssignments('A:1, A:2', ['A']);
+check('重复名称被拒绝', p6.errors.length === 1);
+const p7 = solver.parseAssignments('', ['A']);
+check('空内容报错', p7.errors.length >= 1);
+const p8 = solver.parseAssignments('A:0', ['A']);
+check('零是非负整数', p8.errors.length === 0 && p8.values.A === 0);
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);

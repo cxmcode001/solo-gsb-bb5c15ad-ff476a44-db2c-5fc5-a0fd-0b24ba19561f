@@ -38,3 +38,7 @@ export const SAMPLE_QUERY: Query = {
   leak: '环管N2',
   outlets: ['展厅B', '咖啡厅', '卫生间'],
 };
+
+/** 示例「供水能力核验」填写内容：供水点供给上限与各保供出口需求量 */
+export const SAMPLE_SUPPLY_CAPS = '市政供水S1: 2, 备用水箱S2: 1';
+export const SAMPLE_OUTLET_DEMANDS = '展厅B: 1, 咖啡厅: 1, 卫生间: 1';

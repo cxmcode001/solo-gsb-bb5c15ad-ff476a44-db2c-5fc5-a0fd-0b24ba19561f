@@ -116,6 +116,71 @@ export interface ResilienceInvalid {
 
 export type ResilienceResult = ResilienceOk | ResilienceInvalid;
 
+/* ---------------- 供水能力核验 ---------------- */
+
+/** 供水能力核验的输入：各供水点供给上限与各出口需求量（均为非负整数）。 */
+export interface CapacityQuery {
+  /** 供水点 → 供给上限 */
+  supplyCaps: Record<string, number>;
+  /** 保供出口 → 需求量 */
+  outletDemands: Record<string, number>;
+}
+
+/** 单个出口的获配结果。 */
+export interface CapacityOutletRow {
+  outlet: string;
+  /** 申报需求量 */
+  demand: number;
+  /** 最大分配下实际获配量 */
+  allocated: number;
+  /** 缺口 = demand - allocated */
+  gap: number;
+  /** 当前阀门状态下是否与任一供水点连通（不连通时获配必为 0） */
+  reachable: boolean;
+}
+
+/** 最小割中的一类限制项：供给上限 / 连通管段 / 出口需求。 */
+export interface CapacityCutGroup {
+  kind: 'supply' | 'pipe' | 'outlet';
+  /** 供给上限：供水点名称；管段：管段编号；出口需求：出口名称（均升序） */
+  items: string[];
+  /** 该组容量合计（供给上限与出口需求按申报值，管段每条计 1） */
+  capacity: number;
+}
+
+export interface CapacityOk {
+  status: 'ok';
+  /** 参与核验的连通管段数（无阀管段 + 当前开启的带阀管段；自环不计） */
+  activePipeCount: number;
+  /** 各供水点供给上限合计 */
+  totalSupplyCap: number;
+  /** 各出口需求合计 */
+  totalDemand: number;
+  /** 总供给最大分配量（= 多源多汇最大流） */
+  totalAllocated: number;
+  /** 总缺口 = totalDemand - totalAllocated */
+  totalGap: number;
+  /** 各出口获配明细，按出口填写顺序 */
+  rows: CapacityOutletRow[];
+  /**
+   * 一组限制总供给的最小割（容量 = totalAllocated），按供给上限 / 管段 / 出口需求分组；
+   * 割中容量为 0 的供给上限或出口需求不列入。
+   */
+  cutGroups: CapacityCutGroup[];
+  /** 最小割容量合计（= totalAllocated） */
+  cutCapacity: number;
+}
+
+export interface CapacityInvalid {
+  status: 'invalid';
+  errors: string[];
+}
+
+export type CapacityResult = CapacityOk | CapacityInvalid;
+
+/** 「名称:数值」清单解析时单个数值的上限（防止误填超大数导致结果失真）。 */
+export const MAX_ASSIGNMENT_VALUE = 1_000_000_000;
+
 /** 参与组合的开启阀门数量上限 */
 export const MAX_OPEN_VALVES = 12;
 /** 收集的最优方案数上限（防止结果爆炸） */
@@ -237,6 +302,63 @@ export function validateQuery(network: Network, query: Query): string[] {
     );
   }
   return errors;
+}
+
+/**
+ * 解析「名称:数值」清单（供水能力核验的供给上限 / 需求量填写格式）。
+ * - 条目之间用逗号、分号或换行分隔；不含冒号的条目内也可用空白分隔多个名称；
+ * - 每个条目为「名称:数值」（冒号可用半角 : 或全角 ：，冒号两侧空格允许），数值须为非负整数；
+ * - 只写名称、不写数值时按 1 计；
+ * - 名称必须出现在 allowedNames 中，且不可重复。
+ */
+export function parseAssignments(
+  text: string,
+  allowedNames: string[]
+): { values: Record<string, number>; errors: string[] } {
+  const errors: string[] = [];
+  const values: Record<string, number> = {};
+  const allowed = new Set(allowedNames);
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return { values, errors: ['内容为空：请按「名称:数值」填写，多个用逗号或换行分隔。'] };
+  }
+  // 先按逗号 / 分号 / 换行拆条目；不含冒号的条目再按空白拆，兼容只写名称的写法
+  const rawEntries = trimmed
+    .split(/[,，;；\r\n]+/u)
+    .flatMap((part) => {
+      const t = part.trim();
+      if (!t) return [];
+      if (/[:：]/u.test(t)) return [t];
+      return t.split(/\s+/u).filter((s) => s.length > 0);
+    });
+  for (const entry of rawEntries) {
+    const sep = entry.search(/[:：]/u);
+    const name = (sep >= 0 ? entry.slice(0, sep) : entry).trim();
+    const numText = sep >= 0 ? entry.slice(sep + 1).trim() : '';
+    if (!name) {
+      errors.push(`条目「${entry}」缺少名称。`);
+      continue;
+    }
+    if (!allowed.has(name)) {
+      errors.push(`条目「${entry}」的名称「${name}」不在可填写的节点列表中。`);
+      continue;
+    }
+    if (values[name] !== undefined) {
+      errors.push(`「${name}」重复填写。`);
+      continue;
+    }
+    if (sep >= 0 && !/^\d+$/u.test(numText)) {
+      errors.push(`「${name}」的数值「${numText}」不是非负整数。`);
+      continue;
+    }
+    const value = sep >= 0 ? Number(numText) : 1;
+    if (value > MAX_ASSIGNMENT_VALUE) {
+      errors.push(`「${name}」的数值 ${value} 超过上限 ${MAX_ASSIGNMENT_VALUE}。`);
+      continue;
+    }
+    values[name] = value;
+  }
+  return { values, errors };
 }
 
 /** 构建无向邻接表：无阀管段全部保留，带阀管段仅在开启且未被关闭时保留。 */
@@ -414,8 +536,8 @@ class Dinic {
     return this.n;
   }
 
-  /** 增加一条容量为 cap 的有向弧（自动附带零容量反向弧）。 */
-  addArc(u: number, v: number, cap: number): void {
+  /** 增加一条容量为 cap 的有向弧（自动附带零容量反向弧），返回该弧的索引。 */
+  addArc(u: number, v: number, cap: number): number {
     this.next.push(this.head[u]);
     this.to.push(v);
     this.cap.push(cap);
@@ -425,12 +547,36 @@ class Dinic {
     this.to.push(u);
     this.cap.push(0);
     this.head[v] = this.next.length - 1;
+    return this.next.length - 2;
   }
 
   /** 无向单位容量边：两个方向各一条容量 1 的弧。 */
   addUndirectedUnit(u: number, v: number): void {
     this.addArc(u, v, 1);
     this.addArc(v, u, 1);
+  }
+
+  /**
+   * 无向共享容量边：同一对弧的两个方向初始容量各为 cap，
+   * 任一方向占用流量都会消耗另一方向的剩余容量，
+   * 即「同一无向管段双向合计只能占用一次」。
+   */
+  addUndirectedShared(u: number, v: number, cap: number): number {
+    this.next.push(this.head[u]);
+    this.to.push(v);
+    this.cap.push(cap);
+    this.head[u] = this.next.length - 1;
+
+    this.next.push(this.head[v]);
+    this.to.push(u);
+    this.cap.push(cap);
+    this.head[v] = this.next.length - 1;
+    return this.next.length - 2;
+  }
+
+  /** 查询某条弧当前的剩余容量。 */
+  residual(arcIndex: number): number {
+    return this.cap[arcIndex];
   }
 
   private bfs(s: number, t: number): boolean {
@@ -502,6 +648,27 @@ class Dinic {
       }
     }
     return inSinkSide;
+  }
+
+  /**
+   * 最大流后在残量网络上从源点 s 可达的节点集合（沿残量弧正向 BFS）。
+   * 该集合给出「最靠近供水侧」的最小割：割由「可达 → 不可达」的满载弧构成。
+   */
+  sourceSide(s: number): boolean[] {
+    const seen = new Array(this.n + 1).fill(false);
+    seen[s] = true;
+    const queue = [s];
+    while (queue.length > 0) {
+      const u = queue.shift()!;
+      for (let a = this.head[u]; a !== -1; a = this.next[a]) {
+        const v = this.to[a];
+        if (this.cap[a] > 0 && !seen[v]) {
+          seen[v] = true;
+          queue.push(v);
+        }
+      }
+    }
+    return seen;
   }
 }
 
@@ -578,4 +745,143 @@ export function inspectResilience(network: Network, query: Query): ResilienceRes
   });
 
   return { status: 'ok', activePipeCount: edges.length, rows };
+}
+
+/**
+ * 供水能力核验：按当前阀门开闭状态，把管网建成多源多汇最大流模型——
+ * 超级源点以各供水点「供给上限」为容量接入；每条连通管段（无阀管段与开启的
+ * 带阀管段，已关阀不参与）是双向合计容量 1 的无向共享容量边，即同一无向管段
+ * 双向合计只能占用一次；各出口以「需求量」为容量汇入超级汇点。
+ * 最大流即总供给最大分配量，各出口获配量为其汇入汇点弧上的流量；
+ * 同时给出限制总供给的一组最小割（供给上限 / 管段 / 出口需求三类）。
+ * 纯函数，不修改输入网络。
+ */
+export function verifyCapacity(network: Network, query: CapacityQuery): CapacityResult {
+  const errors: string[] = [];
+  const nodeSet = new Set(network.nodes);
+  const supplyNames = Object.keys(query.supplyCaps);
+  const outletNames = Object.keys(query.outletDemands);
+  if (supplyNames.length === 0) errors.push('至少需要填写一个供水点的供给上限。');
+  if (outletNames.length === 0) errors.push('至少需要填写一个保供出口的需求量。');
+  for (const s of supplyNames) {
+    if (!nodeSet.has(s)) errors.push(`供水点「${s}」不在节点列表中。`);
+  }
+  for (const o of outletNames) {
+    if (!nodeSet.has(o)) errors.push(`保供出口「${o}」不在节点列表中。`);
+  }
+  const checkValue = (name: string, value: unknown, label: string): void => {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+      errors.push(`${label}「${name}」的数值必须是非负整数。`);
+    } else if (value > MAX_ASSIGNMENT_VALUE) {
+      errors.push(`${label}「${name}」的数值 ${value} 超过上限 ${MAX_ASSIGNMENT_VALUE}。`);
+    }
+  };
+  for (const s of supplyNames) checkValue(s, query.supplyCaps[s], '供水点');
+  for (const o of outletNames) checkValue(o, query.outletDemands[o], '保供出口');
+  if (errors.length > 0) return { status: 'invalid', errors };
+
+  const supplies = uniquePreservingOrder(supplyNames);
+  const outlets = uniquePreservingOrder(outletNames);
+
+  const edges = collectActiveEdges(network);
+  const indexOf = new Map<string, number>();
+  network.nodes.forEach((node, i) => indexOf.set(node, i));
+  const supplyIdx = new Set(supplies.map((s) => indexOf.get(s)!));
+  const reachable = reachableFromSupplies(edges, indexOf, supplyIdx);
+
+  // Dinic 内部节点编号 0..n-1，另取 n 为超级源点、n+1 为超级汇点
+  const nodeCount = network.nodes.length;
+  const dinic = new Dinic(nodeCount + 1);
+  const source = nodeCount;
+  const sink = nodeCount + 1;
+
+  const supplyArc = new Map<string, number>();
+  for (const s of supplies) {
+    supplyArc.set(s, dinic.addArc(source, indexOf.get(s)!, query.supplyCaps[s]));
+  }
+  for (const e of edges) {
+    // 双向合计容量 1：同一无向管段两个方向共享一份容量
+    dinic.addUndirectedShared(indexOf.get(e.from)!, indexOf.get(e.to)!, 1);
+  }
+  const outletArc = new Map<string, number>();
+  for (const o of outlets) {
+    outletArc.set(o, dinic.addArc(indexOf.get(o)!, sink, query.outletDemands[o]));
+  }
+
+  const totalAllocated = dinic.maxFlow(source, sink);
+
+  // 各出口获配量 = 需求弧上已使用的容量
+  const rows: CapacityOutletRow[] = outlets.map((outlet) => {
+    const demand = query.outletDemands[outlet];
+    const allocated = demand - dinic.residual(outletArc.get(outlet)!);
+    return {
+      outlet,
+      demand,
+      allocated,
+      gap: demand - allocated,
+      reachable: reachable[indexOf.get(outlet)!],
+    };
+  });
+
+  // 最小割：残量网络中源点可达集 S，跨越 S→汇侧的满载原始弧即割项，
+  // 按「供给上限 / 连通管段 / 出口需求」三类分组；容量为 0 的项不构成实际限制，不列入。
+  const inSourceSide = dinic.sourceSide(source);
+  const cutSupply: string[] = [];
+  const cutPipe: string[] = [];
+  const cutOutlet: string[] = [];
+  for (const s of supplies) {
+    if (query.supplyCaps[s] === 0) continue;
+    if (!inSourceSide[indexOf.get(s)!] && dinic.residual(supplyArc.get(s)!) === 0) {
+      cutSupply.push(s);
+    }
+  }
+  for (const e of edges) {
+    const u = indexOf.get(e.from)!;
+    const v = indexOf.get(e.to)!;
+    if (inSourceSide[u] !== inSourceSide[v]) cutPipe.push(e.id);
+  }
+  for (const o of outlets) {
+    if (query.outletDemands[o] === 0) continue;
+    if (inSourceSide[indexOf.get(o)!] && dinic.residual(outletArc.get(o)!) === 0) {
+      cutOutlet.push(o);
+    }
+  }
+  cutSupply.sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+  cutPipe.sort();
+  cutOutlet.sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+
+  const cutGroups: CapacityCutGroup[] = [];
+  if (cutSupply.length > 0) {
+    cutGroups.push({
+      kind: 'supply',
+      items: cutSupply,
+      capacity: cutSupply.reduce((sum, s) => sum + query.supplyCaps[s], 0),
+    });
+  }
+  if (cutPipe.length > 0) {
+    cutGroups.push({ kind: 'pipe', items: cutPipe, capacity: cutPipe.length });
+  }
+  if (cutOutlet.length > 0) {
+    cutGroups.push({
+      kind: 'outlet',
+      items: cutOutlet,
+      capacity: cutOutlet.reduce((sum, o) => sum + query.outletDemands[o], 0),
+    });
+  }
+  const cutCapacity = cutGroups.reduce((sum, g) => sum + g.capacity, 0);
+
+  const totalSupplyCap = supplies.reduce((sum, s) => sum + query.supplyCaps[s], 0);
+  const totalDemand = outlets.reduce((sum, o) => sum + query.outletDemands[o], 0);
+
+  return {
+    status: 'ok',
+    activePipeCount: edges.length,
+    totalSupplyCap,
+    totalDemand,
+    totalAllocated,
+    totalGap: totalDemand - totalAllocated,
+    rows,
+    cutGroups,
+    cutCapacity,
+  };
 }

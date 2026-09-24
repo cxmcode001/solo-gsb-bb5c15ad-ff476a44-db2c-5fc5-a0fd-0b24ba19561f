@@ -3,12 +3,16 @@ import {
   parseNetwork,
   solve,
   inspectResilience,
+  verifyCapacity,
+  parseAssignments,
   MAX_OPEN_VALVES,
   type Query,
   type SolveResult,
   type ResilienceResult,
+  type CapacityQuery,
+  type CapacityResult,
 } from './solver';
-import { SAMPLE_NETWORK, SAMPLE_QUERY } from './sample';
+import { SAMPLE_NETWORK, SAMPLE_QUERY, SAMPLE_SUPPLY_CAPS, SAMPLE_OUTLET_DEMANDS } from './sample';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 
@@ -17,11 +21,13 @@ app.innerHTML = `
     <h1>展馆水路检修隔离方案搜索</h1>
     <p class="subtitle">
       粘贴管网拓扑 JSON，指定供水点、漏点与保供出口，可自动搜索最优关阀组合，
-      也可对各保供出口做「保供韧性巡检」（按当前阀门开闭状态估算使其断水至少需失效的管段数）。
+      也可对各保供出口做「保供韧性巡检」（按当前阀门开闭状态估算使其断水至少需失效的管段数），
+      或做「供水能力核验」（按供给上限与出口需求求总供给最大分配并定位瓶颈）。
       组合搜索最多覆盖 ${MAX_OPEN_VALVES} 个当前开启的阀门；求解过程不修改输入中的阀门状态。
     </p>
   </header>
   <main>
+    <div class="input-column">
     <section class="panel input-panel">
       <div class="panel-title">
         <h2>1. 管网拓扑 JSON</h2>
@@ -52,6 +58,30 @@ app.innerHTML = `
         已关阀不参与；多供水点作为整体，环路及并行管段分别计数。
       </p>
     </section>
+    <section class="panel input-panel">
+      <h2>3. 供水能力核验</h2>
+      <div class="fields">
+        <label>
+          供水点供给上限（「名称:非负整数」，多个用逗号或换行分隔）
+          <textarea id="supply-caps" class="small" spellcheck="false"
+            placeholder="如：市政供水S1: 2, 备用水箱S2: 1"></textarea>
+        </label>
+        <label>
+          保供出口需求量（「名称:非负整数」，多个用逗号或换行分隔）
+          <textarea id="outlet-demands" class="small" spellcheck="false"
+            placeholder="如：展厅B: 1, 咖啡厅: 1, 卫生间: 1"></textarea>
+        </label>
+      </div>
+      <div class="button-row">
+        <button id="verify" type="button" class="secondary">供水能力核验</button>
+      </div>
+      <p class="hint">
+        沿用上方「供水点」「保供出口」节点名与当前阀门开闭状态：每条连通管段容量为 1
+        （同一无向管段双向合计只能占用一次），已关阀不参与；在各供水点供给上限与各出口需求量
+        同时约束下求总供给最大分配。
+      </p>
+    </section>
+    </div>
     <div class="side-column">
       <section class="panel result-panel">
         <h2>关阀方案搜索结果</h2>
@@ -63,6 +93,16 @@ app.innerHTML = `
           <p class="hint">
             点击「保供韧性巡检」后，这里按「使其失去全部供水至少需失效的不同管段数」升序列出各出口，
             并给出一组达到该数量的管段编号，供安排巡检。
+          </p>
+        </div>
+      </section>
+      <section class="panel result-panel">
+        <h2>供水能力核验结果</h2>
+        <div id="capacity-result">
+          <p class="hint">
+            填写各供水点供给上限与各保供出口需求量后点击「供水能力核验」，
+            这里列出每个出口的获配量与缺口，并给出一组限制总供给的最小割项目
+            （供给上限、连通管段或出口需求）。
           </p>
         </div>
       </section>
@@ -80,8 +120,11 @@ const topologyEl = el<HTMLTextAreaElement>('#topology');
 const suppliesEl = el<HTMLInputElement>('#supplies');
 const leakEl = el<HTMLInputElement>('#leak');
 const outletsEl = el<HTMLInputElement>('#outlets');
+const supplyCapsEl = el<HTMLTextAreaElement>('#supply-caps');
+const outletDemandsEl = el<HTMLTextAreaElement>('#outlet-demands');
 const resultEl = el<HTMLDivElement>('#result');
 const inspectResultEl = el<HTMLDivElement>('#inspect-result');
+const capacityResultEl = el<HTMLDivElement>('#capacity-result');
 
 function splitList(text: string): string[] {
   return text
@@ -219,6 +262,91 @@ function renderInspection(result: ResilienceResult): void {
     </p>`;
 }
 
+const CUT_KIND_LABEL: Record<string, string> = {
+  supply: '供给上限',
+  pipe: '连通管段（每条容量 1）',
+  outlet: '出口需求',
+};
+
+function renderCapacity(result: CapacityResult): void {
+  if (result.status === 'invalid') {
+    renderErrors(capacityResultEl, '输入有误，无法核验：', result.errors);
+    return;
+  }
+
+  const rows = result.rows.map((row) => {
+    const tag = !row.reachable
+      ? '<span class="tag tag-cut">已断水</span>'
+      : row.gap === 0
+        ? '<span class="tag tag-ok">已满足</span>'
+        : '<span class="tag tag-low">有缺口</span>';
+    return `
+      <tr>
+        <td>${escapeHtml(row.outlet)}</td>
+        <td>${tag}</td>
+        <td class="num">${row.demand}</td>
+        <td class="num"><strong>${row.allocated}</strong></td>
+        <td class="num ${row.gap > 0 ? 'bad' : 'ok'}">${row.gap}</td>
+      </tr>`;
+  });
+
+  const bannerClass = result.totalGap === 0 ? 'banner success' : 'banner warn';
+  const bannerHead =
+    result.totalGap === 0
+      ? `核验完成：总供给可满足全部出口需求，共分配 <strong>${result.totalAllocated}</strong>，总缺口 <strong>0</strong>。`
+      : `核验完成：总供给最大分配 <strong>${result.totalAllocated}</strong> / 总需求 ${result.totalDemand}，总缺口 <strong>${result.totalGap}</strong>。`;
+
+  const cutBlock =
+    result.cutGroups.length > 0
+      ? result.cutGroups
+          .map(
+            (g) => `
+        <tr>
+          <td>${CUT_KIND_LABEL[g.kind]}</td>
+          <td>${g.items.map((x) => `<code>${escapeHtml(x)}</code>`).join('、')}</td>
+          <td class="num">${g.capacity}</td>
+        </tr>`
+          )
+          .join('')
+      : null;
+
+  capacityResultEl.innerHTML = `
+    <div class="${bannerClass}">
+      ${bannerHead}
+      <span class="banner-sub">
+        （供给上限合计 ${result.totalSupplyCap}；需求合计 ${result.totalDemand}；
+        连通管段 ${result.activePipeCount} 条，已关阀不参与）
+      </span>
+    </div>
+    <table>
+      <thead>
+        <tr><th>保供出口</th><th>状态</th><th>需求量</th><th>获配量</th><th>缺口</th></tr>
+      </thead>
+      <tbody>${rows.join('')}</tbody>
+    </table>
+    ${
+      cutBlock
+        ? `<h3 class="table-title">限制总供给的一组最小割（容量合计 ${result.cutCapacity}，等于总分配量）</h3>
+    <table>
+      <thead>
+        <tr><th>限制类型</th><th>割中项目</th><th>容量小计</th></tr>
+      </thead>
+      <tbody>${cutBlock}</tbody>
+    </table>`
+        : result.totalDemand === 0
+          ? `<p class="hint">所有出口需求量均为 0，无需供水，最小割为空。</p>`
+          : `<p class="hint">
+            总分配量为 0 且最小割为空：请检查供水点供给上限是否均为 0，或申报了需求的出口
+            在当前阀门状态下是否只能经已关阀门连接（已关阀不参与）。
+          </p>`
+    }
+    <p class="hint">
+      模型：每条连通管段容量为 1，同一无向管段双向合计只能占用一次；各供水点供给上限与
+      各出口需求量同时作为容量约束，总分配量即多源多汇最大流。右侧割项目同时被卡满即形成瓶颈：
+      供给上限不足表现为「供给上限」割项，管段不足表现为「管段」割项，出口侧表现为「出口需求」割项。
+    </p>`;
+}
+
 function readQuery(): { network: import('./solver').Network; query: Query } {
   let raw: unknown;
   try {
@@ -254,14 +382,53 @@ function runInspection(): void {
   }
 }
 
+function runVerification(): void {
+  let network: import('./solver').Network;
+  let supplyNames: string[];
+  let outletNames: string[];
+  try {
+    const parsed = readQuery();
+    network = parsed.network;
+    supplyNames = [...new Set(parsed.query.supplies)];
+    outletNames = [...new Set(parsed.query.outlets)];
+  } catch (e) {
+    renderErrors(capacityResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+    return;
+  }
+
+  const capParse = parseAssignments(supplyCapsEl.value, supplyNames);
+  const demandParse = parseAssignments(outletDemandsEl.value, outletNames);
+  const errors: string[] = [];
+  if (supplyNames.length === 0) errors.push('请先在「2. 检修条件」中填写供水点。');
+  if (outletNames.length === 0) errors.push('请先在「2. 检修条件」中填写保供出口。');
+  errors.push(
+    ...capParse.errors.map((m) => `供给上限：${m}`),
+    ...demandParse.errors.map((m) => `出口需求：${m}`)
+  );
+  if (errors.length > 0) {
+    renderErrors(capacityResultEl, '填写有误，无法核验：', errors);
+    return;
+  }
+
+  const capacityQuery: CapacityQuery = {
+    supplyCaps: capParse.values,
+    outletDemands: demandParse.values,
+  };
+  renderCapacity(verifyCapacity(network, capacityQuery));
+}
+
 el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   topologyEl.value = JSON.stringify(SAMPLE_NETWORK, null, 2);
   suppliesEl.value = SAMPLE_QUERY.supplies.join(', ');
   leakEl.value = SAMPLE_QUERY.leak;
   outletsEl.value = SAMPLE_QUERY.outlets.join(', ');
+  supplyCapsEl.value = SAMPLE_SUPPLY_CAPS;
+  outletDemandsEl.value = SAMPLE_OUTLET_DEMANDS;
   run();
   runInspection();
+  runVerification();
 });
 
 el<HTMLButtonElement>('#solve').addEventListener('click', run);
 el<HTMLButtonElement>('#inspect').addEventListener('click', runInspection);
+el<HTMLButtonElement>('#verify').addEventListener('click', runVerification);
